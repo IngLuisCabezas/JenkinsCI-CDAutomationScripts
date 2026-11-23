@@ -1,0 +1,407 @@
+#!/bin/bash
+# Define color codes
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+GREEN='\033[0;32m'
+NC='\033[0m' # No Color
+# Log
+TS=$(date '+%Y%m%d_%H%M%S')
+OUTPUT_FILE="PrePost_Deployment_Validations_$TS.log"
+exec > >(tee -a "$OUTPUT_FILE") 2>/dev/null
+# Load environment variables
+[ -f "$HOME/.profile" ] && . "$HOME/.profile"  >/dev/null 2>&1 || true
+#########################################################################################################################################
+MIN_ATA_HOME_FREE_GB=50            # Minimum free space required for ATA_HOME, threshold in GiB.
+MIN_TMP_FREE_GB=5                  # Minimum free space required for /tmp directory, threshold in GiB.
+MIN_MEM_AVAILABLE_GB=5             # Minimum free Memory Available, threshold in GiB.
+MAX_TNSPING_LATENCY_MS=200         # Maximum expected latency threshold (in milliseconds)
+MAX_TABLESPACE_USED_PCT=50         # Maximum percentage of tablespace utilization allowed before the check is marked as FAIL
+ORASQL_EXEC_LIMIT=300              # Only list queries that have been executing for <duration> seconds or more.     
+##########################################################################################################################################
+sv_user=$USER
+# Functions
+finished_script() {
+echo -e "\n-------------------------------------------\nProcess ended: $(date)\n-------------------------------------------\n"
+}
+# Starting Script
+echo -e "\n\n---------------------------------------------\nProcess started: $(date)\n---------------------------------------------\n"
+echo -e "Pre- and Post-Deployment Validations\nENVIRONMENT USERNAME: ${sv_user}\nORACLE_SID: ${ORACLE_SID}"
+echo -e "\nHealth Check Result Indicators:"
+echo -e "${RED}|==> [FAIL]:${NC} Review required - please investigate and remediate."
+echo -e "${YELLOW}|==> [WARN]:${NC} Verification needed - please confirm accuracy."
+echo -e "${GREEN}|==> [PASS]:${NC} Output validated - results meet expected criteria.\n"
+# Go through every single instance
+instances_array=($(da_dump InstanceStatus | sed -n 1!p | awk -F '"*,"*' '{print $24}'))
+for ((i=0; i<${#instances_array[@]}; i++)); do
+# Servername InstanceStatus
+    host="${instances_array[$i]}"
+# HA is Active?    
+    HA=$(env | grep 'HA_ACTIVE=1' | wc -l)
+    if [ "$HA" -eq "1" ]; then
+    	sv_ha=1
+    else
+    	sv_ha=0
+    fi
+# SV Instance Type
+    if [ "${#instances_array[@]}" -eq 1 ]; then
+    	sv_type=1
+    else
+    	if [ "$i" -eq 0 ]; then
+        	sv_type=2
+       	else
+        	sv_type=3
+        fi
+   	fi
+# Pass variables, execute ksh.
+    ssh "$sv_user@$host" 'ksh -s' -- "$sv_type" "$i" "$host" "$sv_ha" "$MIN_ATA_HOME_FREE_GB" "$MIN_TMP_FREE_GB" "$MIN_MEM_AVAILABLE_GB" "$MAX_TNSPING_LATENCY_MS" "$MAX_TABLESPACE_USED_PCT" "$ORASQL_EXEC_LIMIT" <<'REMOTE_KSH'
+[ -f "$HOME/.profile" ] && . "$HOME/.profile"  >/dev/null 2>&1 || true
+# Remote side (ksh)
+set -u
+# Receive arguments
+sv_type="$1"
+i="$2"
+instance="$3"
+sv_ha="$4"
+MIN_ATA_HOME_FREE_GB="$5"
+MIN_TMP_FREE_GB="$6"
+MIN_MEM_AVAILABLE_GB="$7"
+MAX_TNSPING_LATENCY_MS="$8"
+MAX_TABLESPACE_USED_PCT="$9"
+ORASQL_EXEC_LIMIT="${10}"
+
+# Define color codes
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+GREEN='\033[0;32m'
+NC='\033[0m' # No Color
+# Functions
+####
+run_sv1_wihoutHA() {
+    
+    typeset MAX_TABLESPACE_USED_PCT="$1"
+    typeset sv_type="$2"
+    ###
+    
+if [ "$sv_type" -eq 2 ]; then  
+    output=$(sv_status -cluster 2>&1 | tail -n +2)
+    while read -r line; do
+    # Alert conditions
+        if ( [ "$line" = 'Server is in an unknown state. Tuxedo is running, but no BBL process exists on the server.' ] ||
+            [ "$line" = 'CB Server NOT RUNNING.' ] ||
+            [ "$line" = 'NO server running' ] ||
+            [ "$line" = 'Server Common Processes RUNNING' ] ||
+            [ "$line" = 'Server is STARTING UP.' ] ||
+            [ "$line" = 'Server is SHUTTING DOWN.' ] ||
+            [ "$line" = 'Unknown.' ] ); then
+            print "${RED}|==> [FAIL][sv_status -cluster]:CB ERROR:${NC}[ $line]"
+        fi
+    done <<< "$output"
+    ###
+    output=$(sv_status -cluster | grep -e 'PE Server')
+    while read -r line; do
+        Active=$(echo "$line" | awk '{print $7}')
+        Standby=$(echo "$line" | awk '{print $9}')
+        RESTRICTED=$(echo "$line" | awk '{print $5}')
+        if [ "$line" = 'PE Server NOT RUNNING.' ]; then
+            print "${RED}|==> [FAIL]:[(sv_status -cluster]:PE Error:${NC}[ $line]"
+        fi
+        if [ "$Active" = 'Active' ] || [ "$Standby" = 'Standby' ] && [ "$RESTRICTED" != 'RESTRICTED' ]  ; then
+            print "${GREEN}|==> [PASS]:[sv_status -cluster]:${NC}[ $line]"
+        fi
+        if [ "$RESTRICTED" = 'RESTRICTED' ]; then
+            print "${RED}|==> [FAIL]:[sv_status -cluster]:${NC}PE Error:[ $line]"
+        fi
+    done <<< "$output"  
+    ###
+ 	# Get all rows where last column = 1
+	enabled_rows=$(cfg STD -l ENABLED | awk 'NF>=3 && $NF==1 {print $1, $2}')
+	rc=$?
+	if [ "$rc" -ne 0 ]; then
+    	print "${RED}|==> [FAIL]:[Validate STD process is active]:${NC}[Unable to run 'cfg STD -l ENABLED' (rc=$rc)]"
+	else
+    	count=$(printf "%s\n" "$enabled_rows" | wc -l | tr -d ' ')
+    	case "$count" in
+	        0)
+            	print "${RED}|==> [FAIL]:[Validate STD process is active]:${NC}[No STD enabled]"
+            	;;
+      		1)
+            	# Exactly one: extract index and STD name
+            	read idx stdname <<EOF
+$enabled_rows
+EOF
+            	# Get instance name
+            	instance=$(cfg STD "$idx" INSTANCE | awk 'NF>0 {print $1; exit}')
+            	# Check if Standby
+            	if sv_status "$instance" | grep -q 'Standby'; then
+                	print "${RED}|==> [FAIL]:[Validate STD process is active]:${NC}[STD running in Standby PE Node $instance]"
+           	 	else
+                	print "${GREEN}|==> [PASS]:[Validate STD process is active]:${NC}[STD running in $instance, not on the first deployment node (Standby PE node)]"
+            	fi
+            	;;
+        	*)
+            	print "${RED}|==> [FAIL]:[Validate STD process is active]:${NC}[More than one STD enabled]"
+            	printf "%s\n" "$enabled_rows"
+            	;;
+    	esac
+	fi
+ ###
+fi    
+    output=$(cbtasks 2>&1 | grep 'No tasks.' | wc -l)
+    if [ "$output" -eq "1" ]; then
+        print "${GREEN}|==> [PASS]:[cbtasks]${NC}:[ No tasks.]"
+    else
+        print "${YELLOW}|==> [WARN]:[cbtasks]${NC}:[ CB tasks found, please validate.]"
+    fi
+    ###
+    output=$(orasize | awk -v t="$MAX_TABLESPACE_USED_PCT" '
+        NF >= 8 &&
+        $(NF-1) ~ /^[0-9.]+$/ &&
+        $1 != "Total" &&
+        $1 !~ /^-+/ &&
+        $0 !~ /TEMP/ {
+        used = 100 - $(NF-1)
+        if (used > t) {
+            printf "%-25s Used=%5.1f%%\n", $1, used
+            fail = 1
+            }
+        }
+        END { exit fail }
+    ')
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        print "${GREEN}|==> [PASS]:[Database storage utilization]:${NC}[ Tablespace usage is healthy and below ${MAX_TABLESPACE_USED_PCT}% ]"
+    else
+        print "${RED}|==> [FAIL]:[Database storage utilization]:${NC}[  Tablespaces above ${MAX_TABLESPACE_USED_PCT}% ]"
+        print "$output"
+    fi
+    ###
+	output=$(dbverify 2>&1)
+    if echo "$output" | grep -q 'table.diff'; then
+    	diff_line=$(echo "$output" | grep 'table.diff')
+    	print "${RED}|==> [FAIL]:[dbverify]:${NC}:[$diff_line]"
+    else
+   	    print "${GREEN}|==> [PASS]:[dbverify]:${NC}:[No 'table.diff' found]"
+	fi
+    output=$(orasql -e $ORASQL_EXEC_LIMIT 2>&1)
+    if echo "$output" | grep -q 'No matching active SQL!!'; then
+    	diff_line=$(echo "$output" | grep 'No matching active SQL!!')
+    	print "${GREEN}|==> [PASS]:[orasql -e $ORASQL_EXEC_LIMIT]:${NC}:[$diff_line]"
+	else
+   		print "${RED}|==> [FAIL]:[orasql -e $ORASQL_EXEC_LIMIT]:${NC}:[Queries found that have been executing for $ORASQL_EXEC_LIMIT seconds or more. Please check]"
+	fi
+    ###         
+    ztables=$(sqlplus -S "$ATADBACONNECT" <<EOF
+SET PAGESIZE 0
+SET FEEDBACK OFF
+SET HEADING OFF
+SET VERIFY OFF
+SET LINESIZE 32000
+SET TIMING OFF
+SELECT table_name FROM all_tables WHERE table_name LIKE 'Z%';
+EXIT
+EOF
+)
+    # Remove empty lines and normalize
+    ztables=$(echo "$ztables" | awk 'NF')
+    if [ -z "$ztables" ]; then
+        print "${GREEN}|==> [PASS]:[ztables check]:${NC}[  No tables starting with 'Z' were found]"
+    else
+        count=$(echo "$ztables" | wc -l | tr -d ' ')
+        print "${RED}|==> [FAIL]:[ztables check]:${NC}[Found $count table(s) starting with 'Z']"
+        print "[ztables Found:]"
+        echo "$ztables"
+    fi
+    ###
+	debug_check=$(sqlplus -S "$ATADBACONNECT" <<EOF
+SET PAGESIZE 0
+SET FEEDBACK OFF
+SET HEADING OFF
+SET VERIFY OFF
+SET LINESIZE 32767
+SET TRIMSPOOL ON
+SET TIMING OFF
+SELECT
+       cit.configuration_item_type_name || '|' ||
+       ci.configuration_item_name || '|' ||
+       cat.configuration_attr_name || '|' ||
+       ca.value
+FROM configuration_attribute ca
+JOIN configuration_attr_type cat USING (configuration_attr_type_id)
+JOIN configuration_item ci USING (configuration_item_id)
+JOIN configuration_item_type cit
+  ON ci.configuration_item_type_id = cit.configuration_item_type_id
+WHERE (cat.configuration_attr_name LIKE '%DEBUG%'
+       AND ca.value IS NOT NULL
+       AND ca.value <> '0')
+   OR (cat.configuration_attr_name = 'COMMAND_LINE_ARGS'
+       AND ca.value LIKE '%-d%')
+ORDER BY
+       cit.configuration_item_type_name,
+       ci.configuration_item_name,
+       cat.configuration_attr_name;
+
+EXIT;
+EOF
+)
+    # Remove empty lines
+	debug_check=$(print -- "$debug_check" | awk 'NF')
+	if [[ -z "$debug_check" ]]; then
+    	print -- "${GREEN}|==> [PASS]:[Conf. Items Debug check]:${NC}[No configuration items with debug enabled found]"
+	else
+   		count=$(print -- "$debug_check" | wc -l | tr -d ' ')
+    	print -- "${RED}|==> [FAIL]:[Conf. Items Debug check]:${NC}[Found $count configuration items with debug enabled]"
+        print ""
+    	# Print header + formatted rows
+    	print -- "$debug_check" | awk -F'|' '
+    	BEGIN {
+        	printf "%-25s %-35s %-30s %-20s\n", \
+            "CONFIGURATION_ITEM_TYPE_NAME", \
+            "CONFIGURATION_ITEM_NAME", \
+            "CONFIGURATION_ATTR_NAME", \
+            "VALUE"
+        	printf "%-25s %-35s %-30s %-20s\n", \
+            "--------------------------", \
+            "-----------------------------------", \
+            "------------------------------", \
+            "--------------------"
+    		}
+    	{
+        	printf "%-25s %-35s %-30s %-20s\n", $1, $2, $3, $4
+    	}'
+	fi
+}
+####
+run_svx(){
+typeset svi="$1"
+typeset sv_host="$2"
+typeset MIN_ATA_HOME_FREE_GB="$3"
+typeset MIN_TMP_FREE_GB="$4"
+typeset MIN_MEM_AVAILABLE_GB="$5"
+typeset MAX_TNSPING_LATENCY_MS="$6"
+typeset dir_req=$ATA_HOME
+typeset dir_tmp=/tmp
+###
+output=$(svstatus 2>&1)
+while read -r line; do
+error=$(echo "$line" | awk '{print $1}' | cut -c1-2)
+if [ "$error" = '<E' ] || [ "$error" = '<W' ]; then
+        print "${RED}|==> [FAIL]:[svstatus]:${NC}$(whoami):SV$((svi+1)):${sv_host}:[$line]"
+else
+        if [ "$line" = '<S90003> Singleview is running' ]; then
+        print "${GREEN}|==> [PASS]:[svstatus]:${NC}$(whoami):SV$((svi+1)):${sv_host}:[$line]"
+        fi
+fi
+done <<< "$output"
+sv_output=$(sv_status | tail -n +3)
+print -- "$sv_output"
+###
+output=$(cache_check 2>&1)
+rc=$?
+if [ "$rc" -ne 0 ]; then
+    print "${RED}|==> [FAIL]:[cache_check]:${NC}$(whoami):SV$((svi+1)):${sv_host}:[Error executing cache_check (rc=$rc)]"
+    printf "%s\n" "$output"
+else
+    error_lines=$(printf "%s\n" "$output" | grep '<E')
+    if [ -n "$error_lines" ]; then
+        print "${RED}|==> [FAIL]:[cache_check]:${NC}$(whoami):SV$((svi+1)):${sv_host}:[Found error(s)]"
+        printf "%s\n" "$error_lines"
+    else
+        print "${GREEN}|==> [PASS]:[cache_check]:${NC}$(whoami):SV$((svi+1)):${sv_host}:[SV cache check is OK]"
+    fi
+fi
+###
+ava_gb=$(df -BG "$dir_req" | awk 'NR==2 {gsub("G","",$4); print $4}')
+if (( ava_gb < MIN_ATA_HOME_FREE_GB )); then
+    print "${RED}|==> [FAIL]:[\$ATA_HOME directory]:${NC}$(whoami):SV$((svi+1)):${sv_host}:[ Directory: ${dir_req}. Required: ${MIN_ATA_HOME_FREE_GB}GB, Available: ${ava_gb}GB]"
+else
+    print "${GREEN}|==> [PASS]:[\$ATA_HOME directory]:${NC}$(whoami):SV$((svi+1)):${sv_host}:[ Directory: ${dir_req}. Required: ${MIN_ATA_HOME_FREE_GB}GB, Available: ${ava_gb}GB]"
+fi
+###
+ava_gb=$(df -BG "$dir_tmp" | awk 'NR==2 {gsub("G","",$4); print $4}')
+if (( ava_gb < MIN_TMP_FREE_GB )); then
+    print "${RED}|==> [FAIL]:[/tmp directory]:${NC}$(whoami):SV$((svi+1)):${sv_host}:[ Directory: ${dir_tmp}. Required: ${MIN_TMP_FREE_GB}GB, Available: ${ava_gb}GB]"
+else
+    print "${GREEN}|==> [PASS]:[/tmp directory]:${NC}$(whoami):SV$((svi+1)):${sv_host}:[ Directory: ${dir_tmp}. Required: ${MIN_TMP_FREE_GB}GB, Available: ${ava_gb}GB]"
+fi
+###
+AVAILABLE_MEM=$(free -g | awk '/^Mem:/ {print $7}')
+if [[ -z "$AVAILABLE_MEM" ]]; then
+  print "${RED}|==> [FAIL]:[Available Memory]:${NC}$(whoami):SV$((svi+1)):${sv_host}:[ ERROR: Unable to determine available memory]"
+fi
+if ! echo "$AVAILABLE_MEM" | grep -q '^[0-9][0-9]*$'; then
+  print "${RED}|==> [FAIL]:[Available Memory]:${NC}$(whoami):SV$((svi+1)):${sv_host}:[ ERROR: Available memory is not numeric: $AVAILABLE_MEM]"
+fi
+if (( AVAILABLE_MEM >= MIN_MEM_AVAILABLE_GB )); then
+  print "${GREEN}|==> [PASS]:[Available Memory]:${NC}$(whoami):SV$((svi+1)):${sv_host}:[ Available memory is ${AVAILABLE_MEM}Gi (>= ${MIN_MEM_AVAILABLE_GB}Gi)]"
+else
+  print "${RED}|==> [FAIL]:[Available Memory]:${NC}$(whoami):SV$((svi+1)):${sv_host}:[ CRITICAL: Available memory is ${AVAILABLE_MEM}Gi (< ${MIN_MEM_AVAILABLE_GB}Gi)]"
+fi
+###
+# Run tnsping silently and extract msec
+msec=$(tnsping "$ORACLE_SID" 2>/dev/null | awk -F'[()]' '/msec/ {print $2}' | awk '{print $1}')
+if [ -z "$msec" ] || ! echo "$msec" | grep -q '^[0-9][0-9]*$'; then
+  print "${RED}|==> [FAIL]:[tnsping $ORACLE_SID]:${NC}$(whoami):SV$((svi+1)):${sv_host}:[ Invalid or missing TNS ping value: '$msec']"
+else
+  if [ "$msec" -gt "$MAX_TNSPING_LATENCY_MS" ]; then
+    print "${RED}|==> [FAIL]:[tnsping $ORACLE_SID]:${NC}$(whoami):SV$((svi+1)):${sv_host}:[ TNS ping ${msec} ms (threshold ${MAX_TNSPING_LATENCY_MS} ms)]"
+  else
+    print "${GREEN}|==> [PASS]:[tnsping $ORACLE_SID]:${NC}$(whoami):SV$((svi+1)):${sv_host}:[ TNS ping ${msec} ms (threshold ${MAX_TNSPING_LATENCY_MS} ms)]"
+  fi
+fi
+###
+}
+
+run_sv_healt_checks() {
+    typeset sv_type="$1"
+    typeset svi="$2"
+    typeset sv_host="$3"
+    typeset sv_ha="$4"
+    typeset MIN_MEM_AVAILABLE_GB="$5"
+    typeset MAX_TNSPING_LATENCY_MS="$6"
+    typeset MAX_TABLESPACE_USED_PCT="$7"
+    typeset ORASQL_EXEC_LIMIT="$8"
+    typeset key="${sv_type}_${sv_ha}"
+    case "$key" in
+        2_1)
+            #|==> sv_type=2 sv_ha=1 Multi-Inst: Just SV1 multi-instance HA
+            print "||======================================================================================================================================||"
+            output=$(sv_ha_ctl cluster_status 2>&1 | grep 'No inactive resources' | wc -l)
+            if [ "$output" -eq "1" ]; then
+            	print "${GREEN}|==> [PASS]:[sv_ha_ctl cluster_status]${NC}:[ No inactive resources]"
+            else
+                print "${RED}|==> [FAIL]:[sv_ha_ctl cluster_status]${NC}:[ Found inactive resources, please check]"
+                sv_ha_ctl cluster_status 2>&1 | grep '* Node'
+            fi    
+            run_sv1_wihoutHA "$MAX_TABLESPACE_USED_PCT" "$sv_type"
+            run_svx "$svi" "$sv_host" "$MIN_ATA_HOME_FREE_GB" "$MIN_TMP_FREE_GB" "$MIN_MEM_AVAILABLE_GB" "$MAX_TNSPING_LATENCY_MS"
+            ;;
+        3_1)
+            #|==> sv_type=3 sv_ha=1: Multi-Inst SVx
+            print "||======================================================================================================================================||"
+            run_svx "$svi" "$sv_host" "$MIN_ATA_HOME_FREE_GB" "$MIN_TMP_FREE_GB" "$MIN_MEM_AVAILABLE_GB" "$MAX_TNSPING_LATENCY_MS"
+            ;;
+        #######################################################################
+        1_0)
+            #|==> sv_type=1 sv_ha=0: Single-Inst SV1
+            print "||======================================================================================================================================||"
+            run_sv1_wihoutHA "$MAX_TABLESPACE_USED_PCT" "$sv_type"
+            run_svx "$svi" "$sv_host" "$MIN_ATA_HOME_FREE_GB" "$MIN_TMP_FREE_GB" "$MIN_MEM_AVAILABLE_GB" "$MAX_TNSPING_LATENCY_MS"
+            ;;
+        2_0)
+            #|==> sv_type=2 sv_ha=0: Just SV1 Multi-instance nonHA
+            print "||======================================================================================================================================||"
+            run_sv1_wihoutHA "$MAX_TABLESPACE_USED_PCT" "$sv_type"
+            run_svx "$svi" "$sv_host" "$MIN_ATA_HOME_FREE_GB" "$MIN_TMP_FREE_GB" "$MIN_MEM_AVAILABLE_GB" "$MAX_TNSPING_LATENCY_MS"
+            ;;
+        3_0)
+            #|==> sv_type=3 sv_ha=0:  Multi-Inst: SVx
+            print "||======================================================================================================================================||"
+            run_svx "$svi" "$sv_host" "$MIN_ATA_HOME_FREE_GB" "$MIN_TMP_FREE_GB" "$MIN_MEM_AVAILABLE_GB" "$MAX_TNSPING_LATENCY_MS"
+            ;;
+       ########################################################################
+    esac
+}
+run_sv_healt_checks "$sv_type" "$i" "$instance" "$sv_ha" "$MIN_MEM_AVAILABLE_GB" "$MAX_TNSPING_LATENCY_MS" "$MAX_TABLESPACE_USED_PCT" "$ORASQL_EXEC_LIMIT"
+REMOTE_KSH
+done
+finished_script

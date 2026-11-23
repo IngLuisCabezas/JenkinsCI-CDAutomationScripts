@@ -1,0 +1,62 @@
+2>&1 Redirects stderr to the same destination as stdout
+2>/dev/null Redirects stderr to /dev/null (the “black hole”).
+echo $? |==> How to know exit status of a command after be executed.
+
+
+✅ Correct ways to hide output
+1️⃣ Hide both stdout and stderr (MOST COMMON)
+cache_check >/dev/null 2>&1
+✔ No output
+✔ Exit code preserved in $?
+
+2️⃣ Hide only stdout (keep errors)
+cache_check >/dev/null
+
+3️⃣ Hide only stderr (keep normal output)
+cache_check 2>/dev/null
+
+
+grep -n 'req_gb' script
+sed -i 's/\breq_gb\b/MIN_ATA_HOME_FREE_GB/g' script
+grep -n 'MIN_ATA_HOME_FREE_GB' script
+
+
+${sv_user^^}" BASH UPPERCASE
+
+dbverify >/dev/null 2>&1
+rc=$?
+if [ "$rc" -eq 0 ]; then
+    print "${GREEN}|==> [PASS]:[dbverify]:${NC}$(whoami):SV$((svi+1)):${sv_host}:[ dbverify is ok]"
+else
+    print "${RED}|==> [FAIL]:[dbverify]]:${NC}$(whoami):SV$((svi+1)):${sv_host}:[ Error Found, please check]"
+fi
+
+
+if [ $? -ne 0 ]
+then
+    exit 1
+fi
+exit 0
+
+#ksh
+
+if [[ -z $ATA_HOME ]]
+then
+   . ~`whoami`/.profile
+fi
+
+
+Enable debug and tracing
+set -axe
+
+-a → export all variables
+-x → print commands as they execute (debugging)
+-e → exit on error (later disabled with set +e)
+
+
+
+BROADCAST_MESSAGE="Singleview ${ENVIRONMENT_NAME} is being worked on by Jenkins in ${wait} minutes.\nReason: Installation of ${RELEASE_CODE}\n. Non-HA systems will shutdown, HA systems will have disruption only on the node it is working on.\nPlease save all work and log out if needed."
+cb |=> ecp "biWall&('$BROADCAST_MESSAGE')"
+pe |=>  ssh ${element} -l ${ENVIRONMENT_NAME} '. ./.profile > /dev/null 2>&1;if [[ `echo $ATA_SV_START_OPTIONS | grep "\-pe" | wc -l` -eq 1 ]]; then c_sap -b "Singleview is being worked on by Jenkins. Reason: Release Installation.\nNon-HA systems will shutdown, HA systems will have disruption only on the node it is working on.\nPlease save all work and log out if needed.";fi'
+        ssh ${element} -l ${ENVIRONMENT_NAME} '. ./.profile > /dev/null 2>&1;if [[ `echo $ATA_SV_START_OPTIONS | grep "\-pe" | wc -l` -eq 1 ]]; then c_sap -k NOLOGIN;fi'
+        

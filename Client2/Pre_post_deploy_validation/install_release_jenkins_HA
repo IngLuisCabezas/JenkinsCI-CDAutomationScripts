@@ -1,0 +1,167 @@
+#!/bin/ksh
+# ================================================================================================
+# Setup basic environment
+# ================================================================================================
+# Uses the following Jenkins parameters setup on the Jenkins job (case sensative):
+# RELEASE_CODE = Release number i.e. "2.05.01"
+# RELEASE_TYPE = "Patch", "Minor", "Major"
+# RELEASE_MODE = "Test", "Final"
+# PROJECT_CODE = Usually 3 letter project code i.e. "SV", "CB1", "MCB", etc.
+
+if [[ -z $ATA_HOME ]]
+then
+   . ~`whoami`/.profile
+fi
+
+# Set wait for all non-build environments
+if [[ ${ENVIRONMENT_NAME} != ${ENVIRONMENT_NAME/bld/} ]]
+then
+   wait=0
+else
+   wait=1
+fi
+
+# Set variables
+set -axe
+#BASE_HOSTNAME=`hostname | rev | cut -c 2- | rev`
+
+MAIN_HOST=`hostname`
+CHECK_MULTIINSTANCE=`da_dump InstanceStatus | sed -n '1!p' | wc -l`
+JENKINS_WORK_DIR=$ATA_HOME/work/jenkins
+JENKINS_WORK_DIR_UP=$JENKINS_WORK_DIR/..
+BROADCAST_MESSAGE="Singleview ${ENVIRONMENT_NAME} is being worked on by Jenkins in ${wait} minutes.\nReason: Installation of ${RELEASE_CODE}\n. Non-HA systems will shutdown, HA systems will have disruption only on the node it is working on.\nPlease save all work and log out if needed."
+
+# ================================================================================================
+# Code
+# ================================================================================================
+# Extract release
+tar -zxvf *${RELEASE_CODE}_${RELEASE_TYPE}_${RELEASE_MODE}.tar.gz
+cd ${RELEASE_CODE}
+set +e
+
+#Prep and send notification
+if [[ $CHECK_MULTIINSTANCE -ge 2 ]]
+then
+        #We are Multi-instance, gather hostnames
+        ecp "biWall&('$BROADCAST_MESSAGE')"
+        my_array=(`da_dump InstanceStatus | awk -F "\"*,\"*" '{print $24}' | sed -n '1!p'`)
+        for element in "${my_array[@]}"
+        do
+                if [[ ${element} != $MAIN_HOST ]]
+                then
+                        rsync --update -raz --progress $JENKINS_WORK_DIR ${ENVIRONMENT_NAME}@${element}:$JENKINS_WORK_DIR_UP
+                fi
+                ssh ${element} -l ${ENVIRONMENT_NAME} '. ./.profile > /dev/null 2>&1;if [[ `echo $ATA_SV_START_OPTIONS | grep "\-pe" | wc -l` -eq 1 ]]; then c_sap -b "Singleview is being worked on by Jenkins. Reason: Release Installation.\nNon-HA systems will shutdown, HA systems will have disruption only on the node it is working on.\nPlease save all work and log out if needed.";fi'
+                ssh ${element} -l ${ENVIRONMENT_NAME} '. ./.profile > /dev/null 2>&1;if [[ `echo $ATA_SV_START_OPTIONS | grep "\-pe" | wc -l` -eq 1 ]]; then c_sap -k NOLOGIN;fi'
+        done
+else
+        #We are single instance
+        ecp "biWall&('$BROADCAST_MESSAGE')"
+        c_sap -b ${BROADCAST_MESSAGE}
+        c_sap -k NOLOGIN
+fi
+
+# HA shutdown management
+if [[ $STEP_NUM -eq 1 ]]
+then
+    if [[ $HA_ACTIVE -eq 1 ]]
+    then
+        CHECK_HA=`sv_ha_ctl cluster_status | grep -e E22975 -e W23164 | wc -l`
+        if [[ $CHECK_HA -eq 1 ]]
+        then
+            unset HA_ACTIVE;unset HA_CM_MODULE
+            sleep $((wait*60))
+            sv_stop -cluster || sv_stop -cluster -kill
+            ipcrm -a  
+
+        else
+            #If cluster status is configured then let the release handle it
+		    # ================================================================================================
+            # code HA -	install in Standby Node
+            ###
+		    pe_standby_node=$(da_dump ClusterStandby | grep -o 'SV[0-9]\+' | head -1)
+		    pe_standby_host=$(da_dump InstanceStatus | awk -F',' -v pe_standby_node="$pe_standby_node" '$1==pe_standby_node {print $24}')
+		    if [ "$pe_standby_host" = "$MAIN_HOST" ]; then
+			    echo "[PASS]: [|==> PE Standby Node: $pe_standby_node is on MAIN HOSTNAME: $pe_standby_host]"
+		    else
+                echo "[FAIL]: [|==> PE Standby Node: $pe_standby_node is on HOSTNAME: $pe_standby_host and needs to be running on HOSTNAME:$MAIN_HOST]"
+			    exit 1
+            fi
+            # Get all rows where last column = 1
+	        enabled_std=$(cfg STD -l ENABLED | awk 'NF>=3 && $NF==1 {print $1, $2}')
+	        rc=$?
+	        if [ "$rc" -ne 0 ]; then
+    	        print "[FAIL]:[|==> Validate STD process is active]:[Unable to run 'cfg STD -l ENABLED' (rc=$rc)]"
+                exit 1
+	        else
+    	        count=$(printf "%s\n" "$enabled_std" | wc -l | tr -d ' ')
+    	        case "$count" in
+	                0)
+            	        print "[FAIL]:[|==> Validate STD process is active]:[No STD enabled]"
+                        exit 1
+            	        ;;
+      		        1)
+            	        # Exactly one: extract index and STD name
+            	        read idx stdname <<EOF
+$enabled_std
+EOF
+            	        # Get instance name
+            	        enabled_sv=$(cfg STD "$idx" INSTANCE | awk 'NF>0 {print $1; exit}')
+                        if [ "$pe_standby_node" = "$enabled_sv" ]; then
+                            echo "[WARNING]:[|==>  STD running in $enabled_sv, PE Standby Node: $pe_standby_node]"
+                            sv_ha_ctl INSTANCE_DISABLE $pe_standby_node 2>&1
+                            #sv_stop -nocb -pe 2>&1
+                            #sv_start -nocb -pe 2>&1
+                            sv_ha_ctl INSTANCE_RESTORE $pe_standby_node 2>&1
+						    enabled_std=$(cfg STD -l ENABLED | awk 'NF>=3 && $NF==1 {print $1, $2}')
+                            read idx stdname <<EOF
+$enabled_std
+EOF
+						    enabled_sv=$(cfg STD "$idx" INSTANCE | awk 'NF>0 {print $1; exit}')
+						    if [ "$pe_standby_node" = "$enabled_sv" ]; then
+							    echo "[FAIL]:[|==>  STD still is running in PE Standby Node: $pe_standby_node, please Move manually STD to other instance ]"
+							    exit 1
+					        else
+                                echo "[PASS]: [|==> STD is running in $enabled_sv and PE Standby Node: $pe_standby_node]"
+						    fi
+                        else
+                            echo "[PASS]: [|==> STD is running in $enabled_sv and PE Standby Node: $pe_standby_node]"
+                        fi
+            	        ;;
+        	        *)
+            	        print "[FAIL]:[|==> Validate STD process is active]:[More than one STD enabled]"
+            	        printf "%s\n" "$enabled_std"
+                        exit 1
+            	        ;;
+    	        esac
+	        fi
+            # ================================================================================================
+
+        fi
+    fi
+
+    if [[ -z $HA_ACTIVE ]]
+    then
+        sv_stop -cluster || sv_stop -cluster -kill
+        ipcrm -a    
+    fi
+fi
+
+
+# Install release
+#./install.${RELEASE_CODE} -v -noexport -nodvp -restart -option "SIZEFILE=current" -option "PostInstall_Question=y" -option "PreStartInstall_Question=y" -s ${STEP_NUM}
+./install.${RELEASE_CODE} -noexport -nodvp -installmode 'cold' -v -restart -option 'SIZEFILE=current' -option 'PostInstall_Question=y' -option 'PreStartInstall_Question=y' -s ${STEP_NUM}
+ret=$?
+#echo "execute = ./install.${RELEASE_CODE} -noexport -nodvp -installmode 'cold' -v -restart -option 'SIZEFILE=current' -option 'PostInstall_Question=y' -option 'PreStartInstall_Question=y' -s ${STEP_NUM}"
+#ret=1
+
+# Copy all logs to Jenkins workspace root directory for archiving
+cp install.${RELEASE_CODE}*.log ${WORKSPACE}
+
+# Finish up
+exit ${ret}
+
+
+# ================================================================================================
+# End of code
+# ================================================================================================

@@ -1,0 +1,50 @@
+
+    ###
+ 	# Get all rows where last column = 1
+	enabled_rows=$(cfg STD -l ENABLED | awk 'NF>=3 && $NF==1 {print $1, $2}')
+	rc=$?
+	if [ "$rc" -ne 0 ]; then
+    	print "[FAIL]:[Validate STD process is active]:[Unable to run 'cfg STD -l ENABLED' (rc=$rc)]"
+        exit 1
+	else
+    	count=$(printf "%s\n" "$enabled_rows" | wc -l | tr -d ' ')
+    	case "$count" in
+	        0)
+            	print "[FAIL]:[Validate STD process is active]:[No STD enabled]"
+                exit 1
+            	;;
+      		1)
+            	# Exactly one: extract index and STD name
+            	read idx stdname <<EOF
+$enabled_rows
+EOF
+            	# Get instance name
+            	instance=$(cfg STD "$idx" INSTANCE | awk 'NF>0 {print $1; exit}')
+            	# Check if Standby
+                standby_instance=$(da_dump ClusterStandby | grep -o 'SV[0-9]\+' | head -1)
+                if [ "$standby_instance" = "$instance" ]; then
+                    echo "[FAIL]:[STD running in PE STANDBY NODE $standby_instance]"
+                    sv_ha_ctl INSTANCE_DISABLE $instance 2>&1
+                    sv_ha_ctl INSTANCE RESTORE $instance 2>&1
+                    
+
+                else
+                    echo "[PASS]: [STD is running in $instance and  PE STANDBY NODE $standby_instance]"
+                fi
+            	;;
+        	*)
+            	print "[FAIL]:[Validate STD process is active]:[More than one STD enabled]"
+            	printf "%s\n" "$enabled_rows"
+                exit 1
+            	;;
+    	esac
+	fi
+
+
+ssh PE NODE
+
+
+# Install release
+./install.${RELEASE_CODE} -v -noexport -nodvp -restart -option "SIZEFILE=current" -option "PostInstall_Question=y" -option "PreStartInstall_Question=y" -s ${STEP_NUM}
+ret=$?
+ ###
